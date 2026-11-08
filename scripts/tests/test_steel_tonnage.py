@@ -402,7 +402,10 @@ class TestBuild(unittest.TestCase):
             self.assertEqual(len(out["rows"]), 3)      # 槽钢补表后进吨位
             self.assertEqual(len(out["spec_rows"]), 4)  # 含仅计数的 H400x200
             md = (td / "ton.md").read_text(encoding="utf-8")
+            self.assertEqual(out["total_basis"], "allocated_estimate")
             self.assertIn("final_quantity=false", md)
+            self.assertIn("总吨位带（分摊草稿，不是答案）", md)
+            self.assertNotIn("总吨位带（推荐）", md)
             self.assertIn("仅计数", md)
 
     def test_drawn_length_fallback(self):
@@ -498,6 +501,143 @@ class TestBuild(unittest.TestCase):
             with self.assertRaises(SystemExit) as ctx:
                 S.build(str(p), str(td / "ton"))
             self.assertIn("非契约 JSON", str(ctx.exception))
+
+
+class TestTotalCaliberAndValidate(unittest.TestCase):
+    """0.3.0：逐根口径优先、分摊字段改名、坐标透传、契约体检与场景值。"""
+
+    def _write(self, td, data):
+        p = Path(td) / "x.steel.json"
+        p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        return p
+
+    def test_member_level_total_preferred_over_allocation(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            data = steel_json(
+                sections=[sec("tube", "Φ1200x50"), sec("tube", "Φ1200x40")],
+                members=[
+                    {"code": "Z1", "x": 1000, "y": 2000,
+                     "evidence": [{"text": "Z1 Φ1200x50 L=4500"}]},
+                    {"code": "Z2", "evidence": [{"text": "Z2 Φ1200x40 L=4500"}]},
+                ],
+            )
+            p = self._write(td, data)
+            S.build(str(p), str(td / "ton"))
+            out = json.loads((td / "ton.json").read_text(encoding="utf-8"))
+            self.assertEqual(out["total_basis"], "member_level")
+            self.assertEqual(out["total_t"], out["total_t_member_level"])
+            self.assertNotEqual(out["total_t"], out["total_t_allocated_estimate"])
+            row_sum = [round(sum(r["tonnage_t"][0] for r in out["member_merge"]), 2),
+                       round(sum(r["tonnage_t"][1] for r in out["member_merge"]), 2)]
+            self.assertEqual(out["total_t"], row_sum)
+            md = (td / "ton.md").read_text(encoding="utf-8")
+            self.assertIn("逐根构件台账求和（推荐口径）", md)
+            self.assertIn("total_t_allocated_estimate", md)
+
+    def test_member_coordinates_passthrough(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            data = steel_json(
+                sections=[sec("tube", "Φ1200x50")],
+                members=[{"code": "Z1", "x": 1000, "y": 2000, "z": 3500,
+                          "rotation": 0,
+                          "evidence": [{"text": "Z1 Φ1200x50 L=4500"}]}],
+            )
+            p = self._write(td, data)
+            S.build(str(p), str(td / "ton"))
+            out = json.loads((td / "ton.json").read_text(encoding="utf-8"))
+            row = out["member_merge"][0]
+            self.assertEqual((row["x"], row["y"], row["z"]), (1000, 2000, 3500))
+            self.assertEqual(row["coord_unit"], "mm")
+            self.assertEqual(row["location_status"], "provided")
+
+    def test_all_known_grades_leave_no_unknown_residual(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            data = steel_json(
+                sections=[sec("tube", "Φ1200x50")],
+                members=[{"code": "Z1", "x": 1000, "y": 2000, "grade": "Q355",
+                          "evidence": [{"text": "Z1 Φ1200x50 L=4500"}]}],
+            )
+            p = self._write(td, data)
+            S.build(str(p), str(td / "ton"))
+            out = json.loads((td / "ton.json").read_text(encoding="utf-8"))
+            self.assertEqual([g["grade"] for g in out["grade_tonnage"]], ["Q355"])
+            self.assertAlmostEqual(out["grade_tonnage"][0]["tonnage_t"][0],
+                                   out["total_t"][0], places=2)
+
+    def test_member_level_grade_keeps_plate_tonnage_in_unknown(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            data = steel_json(
+                sections=[sec("tube", "Φ1200x50")],
+                members=[{"code": "Z1", "grade": "Q355",
+                          "evidence": [{"text": "Z1 Φ1200x50 L=4500"}]}],
+            )
+            data["connections"] = [conn("plate_connection", "节点板 PL20x400x600")]
+            p = self._write(td, data)
+            S.build(str(p), str(td / "ton"))
+            out = json.loads((td / "ton.json").read_text(encoding="utf-8"))
+            grades = {g["grade"]: g["tonnage_t"] for g in out["grade_tonnage"]}
+            self.assertIn("Q355", grades)
+            self.assertIn("unknown_grade", grades)
+            self.assertEqual(grades["unknown_grade"],
+                             [round(out["connection_plate_total_t"][0], 2),
+                              round(out["connection_plate_total_t"][1], 2)])
+            grade_sum = [sum(g["tonnage_t"][0] for g in out["grade_tonnage"]),
+                         sum(g["tonnage_t"][1] for g in out["grade_tonnage"])]
+            self.assertAlmostEqual(grade_sum[0], out["total_t"][0], places=2)
+            self.assertAlmostEqual(grade_sum[1], out["total_t"][1], places=2)
+
+    def test_validate_reports_count_only_and_unmatched(self):
+        data = steel_json(
+            sections=[sec("h_section", "H400x200")],
+            members=[{"code": "GL-9", "evidence": [{"text": "GL-9"}]}],
+        )
+        rep = S.contract_health(data)
+        self.assertEqual(rep["schema"], "cad-steel-contract-health/v1")
+        self.assertEqual(rep["status"], "warn")
+        self.assertEqual(rep["sections"][0]["status"], "count_only")
+        self.assertIn("GL-9", rep["members"]["no_section"])
+        text = S.format_health(rep)
+        self.assertIn("契约可计算，但有需复核项", text)
+        self.assertIn("只能计数", text)
+
+    def test_validate_rejects_noncontract_schema(self):
+        rep = S.contract_health({"schema": "other/v1"})
+        self.assertEqual(rep["status"], "error")
+        self.assertTrue(any("schema" in e for e in rep["errors"]))
+
+    def test_validate_path_does_not_write_tonnage_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            p = self._write(td, steel_json(
+                sections=[sec("tube", "Φ1200x50")],
+                members=[{"code": "Z1", "evidence": [{"text": "Z1 Φ1200x50 L=4500"}]}]))
+            rep = S.validate_path(str(p))
+            self.assertNotEqual(rep["status"], "error")
+            self.assertFalse((td / "ton.json").exists())
+
+    def test_length_scenarios_are_labeled_estimates(self):
+        rows = S.length_scenario_rows(
+            [{"kg_m": 100.0, "count": 2}, {"kg_m": 0.0, "count": 3}], [4.0, 6.0])
+        self.assertEqual([r["length_m"] for r in rows], [4.0, 6.0])
+        self.assertAlmostEqual(rows[0]["total_t_band"][0], 0.68, places=3)
+        self.assertAlmostEqual(rows[0]["total_t_band"][1], 0.92, places=3)
+        self.assertIn("场景值", rows[0]["basis"])
+
+    def test_empty_evidence_is_explained_in_report(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            p = self._write(td, steel_json(
+                sections=[sec("tube", "Φ1200x50")],
+                members=[{"code": "Z1", "evidence": [{"text": "Z1 Φ1200x50 L=4500"}]}]))
+            S.build(str(p), str(td / "ton"))
+            md = (td / "ton.md").read_text(encoding="utf-8")
+            self.assertIn("输入无证据", md)
+            self.assertIn("`connections[]` 为空", md)
+            self.assertIn("`finishes[]` 为空", md)
 
 
 if __name__ == "__main__":
