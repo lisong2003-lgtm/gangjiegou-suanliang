@@ -2,11 +2,11 @@
 name: gangjiegou-suanliang
 slug: gangjiegou-suanliang
 displayName: 钢结构算量 · 吨位估算带
-version: 0.3.1
+version: 0.3.8
 platforms: [macos, windows, linux]
 author: lis
 license: CC-BY-NC-SA-4.0
-description: "钢结构算量：消费 cad-file-reader 的 *.steel.json，按截面标注/米重公式/显式或图面长度出吨位估算带（json/md/csv），含牌号分档、构件归并、连接计数、节点板、涂装面积、复核清单。不做识图，不替代深化/翻样/下料/结算/报价。"
+description: "钢结构出吨位估算；不识图、不替代结算。触发词：钢结构算量、钢构、H型钢。"
 i18n:
   en: README.en.md
   zh: README.md
