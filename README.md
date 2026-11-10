@@ -2,9 +2,9 @@
 
 **[English](./README.en.md) | [中文](./README.md)**
 
-**v0.3.0** · 给已有钢结构识图产物的使用者：不碰图纸解析，只把 `cad-file-reader` 钢结构包的 `*.steel.json` 变成 **截面谱 + 吨位估算带 + 构件台账**。
+**v0.4.0** · 正式量只从 `lis-skill-bus` 按 `contract_id` 取契约；不碰图纸解析，只把 `cad-file-reader` 的钢结构契约变成 **截面谱 + 吨位估算带 + 构件台账**。
 
-正式识图链路固定为 `cad-file-reader -> cad-contract/v1 -> lis-skill-bus -> gangjiegou-suanliang`。本技能不读取 DWG/DXF/PDF，也不提供绕开 `cad-file-reader` 或 `lis-skill-bus` 的第二套识图路径。
+正式识图链路固定为 `cad-file-reader -> cad-contract/v1 -> lis-skill-bus -> gangjiegou-suanliang`。本技能不读取 DWG/DXF/PDF，也不提供绕开 `cad-file-reader` 或 `lis-skill-bus` 的第二套识图路径。`--steel`/位置参数是文件入口，必须显式 `--allow-manual`，一律按 `manual` 降级，不是正式量。
 
 ## 先确认能不能用
 
@@ -15,8 +15,8 @@ python3 scripts/steel_tonnage.py --check-deps
 ```
 
 - 两项都找到：退出码 0，正式识图链路可开工。
-- 缺任意一项：退出码 1，明确列出缺什么；此时仍可计算**已有** `*.steel.json`，但不能从 DWG 开始识图。
-- `manifest.json` 的 `requires.skills` 已声明最低版本：`cad-file-reader>=0.39.2（含 cad-file-reader:packs/steel-geometry）`、`lis-skill-bus>=0.1.9`。
+- 缺任意一项：退出码 20/21（缺 reader 20、缺 bus 21），明确列出缺什么，并给一条可复制安装命令；此时不能从 DWG 开始识图。文件契约仍可计算，但必须显式 `--allow-manual`，结果 `final_quantity=false`，不是正式量。
+- `manifest.json` 的 `requires.skills` 已声明最低版本：`cad-file-reader>=0.41.0（含 cad-file-reader:packs/steel-geometry）`、`lis-skill-bus>=0.1.11`。
 
 ## 能做什么
 
@@ -46,7 +46,7 @@ python3 scripts/steel_tonnage.py --check-deps
 ### 1. 正式识图链路
 
 ```bash
-# 先探测前置；缺依赖时退出码 1
+# 先探测前置；缺依赖时退出码 20/21
 python3 scripts/steel_tonnage.py --check-deps
 
 # 复用同项目/楼栋/楼层的契约；命中则不再解图
@@ -68,19 +68,20 @@ bash skills/cad-file-reader/scripts/cad_statesync.sh push \
 python3 scripts/steel_tonnage.py \
   --validate 钢结构识图/钢结构详情.steel.json --report 契约体检.json
 
-# 计算并落盘 json/md/csv
+# 正式量：从 bus 按 contract_id 取契约并落盘 json/md/csv
+# contract_id 见 push 输出或 bus pull 结果
 python3 scripts/steel_tonnage.py \
-  --steel 钢结构识图/钢结构详情.steel.json --out-prefix 钢结构吨位
+  --from-contract <contract_id> --project 项目 --out-prefix 钢结构吨位
 ```
 
-### 2. 已有契约直接计算
+### 2. 从 bus 取正式契约
 
 ```bash
 python3 scripts/steel_tonnage.py \
-  --steel 已有产物.steel.json --out-prefix /tmp/steel-tonnage
+  --from-contract <contract_id> --project 项目 --out-prefix /tmp/steel-tonnage
 ```
 
-这是计算入口，不是第二套识图路径。契约必须由正式链路生成，或按 `examples/README.md` 手工构造。
+这是正式量入口，不是第二套识图路径。契约必须由正式链路生成并经 `lis-skill-bus` 保存；不要把 bus 产物另存成本地文件后当正式契约送入，文件入口会强制降级为 manual。
 
 ### 3. 手工契约（受支持的降级路径）
 
@@ -89,7 +90,7 @@ python3 scripts/steel_tonnage.py \
 ```bash
 python3 scripts/steel_tonnage.py --validate examples/minimal.steel.json
 python3 scripts/steel_tonnage.py \
-  --steel examples/minimal.steel.json --out-prefix /tmp/minimal-ton
+  --steel examples/minimal.steel.json --allow-manual --out-prefix /tmp/minimal-ton
 ```
 
 `examples/minimal.steel.json` 是最小样本；`examples/README.md` 写明必填字段、截面↔构件配对规则、坐标单位（mm）和 `$` 嵌套图层名处理。
@@ -98,7 +99,7 @@ python3 scripts/steel_tonnage.py \
 
 ```bash
 python3 scripts/steel_tonnage.py \
-  --steel 已有产物.steel.json --out-prefix 钢结构吨位 \
+  --from-contract <contract_id> --project 项目 --out-prefix 钢结构吨位 \
   --length-scenario 4.5 --length-scenario 6 --length-scenario 9
 ```
 
@@ -108,10 +109,13 @@ python3 scripts/steel_tonnage.py \
 
 | 参数 | 作用 | 退出码 |
 |---|---|---|
-| `--check-deps` | 只探测 `cad-file-reader` / `lis-skill-bus`，不出数 | 齐全 0，缺依赖 1 |
+| `--check-deps` | 只探测 `cad-file-reader` / `lis-skill-bus`，不出数；缺失时回显一条安装命令 | 齐全 0，缺依赖 1 |
 | `--validate <json>` | 只体检契约：缺字段、未匹配截面、仅计数、长度证据、依赖状态 | 可计算 0，结构错误 2 |
 | `--report <json>` | 把体检结果另存为 `cad-steel-contract-health/v1` | 随 `--validate` |
-| `--steel <json>` | 计算输入契约 | 成功 0 |
+| `--from-contract <id>` | 正式入口：从 `lis-skill-bus` 按 `contract_id` 取契约 | 成功 0；取不到或来源不符 1/3/4 |
+| `--project <项目>` | `--from-contract` 使用的 bus 项目标识 | 随 `--from-contract` |
+| `--steel <json>` | 文件/手工契约入口，必须同时给 `--allow-manual` | 成功 0；缺开关 3 |
+| `--allow-manual` | 显式允许文件契约；强制 `provenance=manual`、`formal_ledger_eligible=false` | 随文件入口 |
 | `--out-prefix <前缀>` | 输出 `.json/.md/.csv` 前缀 | 成功 0 |
 | `--length-scenario <m>` | 可重复，输出长度敏感性场景 | 成功 0 |
 
@@ -141,7 +145,7 @@ python3 scripts/steel_tonnage.py \
 - `*.md`：可读复核报告，置顶显示推荐吨位、分摊参考、长度依据、前置状态和需复核项。
 - `*.csv`：总吨位带、分截面吨位、构件台账、连接/涂装和截面谱摘要。
 
-关键字段：`length_basis`、`length_used_m`、`rows`、`spec_rows`、`only_count`、`total_t`、`total_basis`、`total_t_member_level`、`total_t_allocated_estimate`、`member_merge`、`length_scenarios`、`allowance_advice`、`geometry_closure_check`、`prerequisites`、`input_evidence`、`summary`。
+关键字段：`provenance`、`contract_id`、`source_sha256`、`contract_sha256`、`reader_version`、`formal_ledger_eligible`、`run_manifest`、`length_basis`、`length_used_m`、`rows`、`spec_rows`、`only_count`、`total_t`、`total_basis`、`total_t_member_level`、`total_t_allocated_estimate`、`member_merge`、`length_scenarios`、`allowance_advice`、`geometry_closure_check`、`prerequisites`、`input_evidence`、`summary`。
 
 `steel_geometry[]`、`connections[]`、`finishes[]` 为空时，报告明写“输入无证据”，与“技能未实现”区分。
 
@@ -155,17 +159,20 @@ python3 scripts/steel_tonnage.py \
 ## 依赖
 
 - Python 3.10+；主计算入口只用标准库。
-- 正式识图：`cad-file-reader>=0.39.2`（含 `cad-file-reader:packs/steel-geometry`）与 `lis-skill-bus>=0.1.9`。
-- 已有契约或手工契约：不需要上述两个技能在位，直接计算。
+- 正式识图：`cad-file-reader>=0.41.0`（含 `cad-file-reader:packs/steel-geometry`）与 `lis-skill-bus>=0.1.11`。
+- 已有契约或手工契约：不需要上述两个技能在位，但文件入口必须显式 `--allow-manual`；结果不是正式量。`--from-contract` 需要 `lis-skill-bus` 在位。
 
 ## 验证
 
 ```bash
+python3 tests/test_entry_gate.py
 cd scripts/tests
 python3 -m unittest test_steel_tonnage
 ```
 
-v0.3.0 含 **49 项合成数据单测**，覆盖米重公式、GB/T 706 查表、长度两档、无长度降级、输入契约拒绝、重复编号提示、牌号分档、`unknown_grade`、节点板吨位与牌号余量、构件归并复核、连接分类计数、涂装面积降级、逐根/分摊双口径、坐标透传、`--validate` 体检和长度敏感性场景。
+当前 v0.4.3 含 **35 项入口闸门断言 + 49 项合成数据单测**。入口测试覆盖 `--check-deps`、手工契约 exit 3、`--allow-manual` 降级、伪造 reader 拒绝、bus 缺契约、`cad-contract/v0` 版本拒绝和正常 reader 契约；49 项旧测试覆盖米重公式、GB/T 706 查表、长度两档、无长度降级、输入契约拒绝、重复编号提示、牌号分档、`unknown_grade`、节点板吨位与牌号余量、构件归并复核、连接分类计数、涂装面积降级、逐根/分摊双口径、坐标透传、`--validate` 体检和长度敏感性场景。
+
+准入边界：`provenance`/`contract_id` 仍不是密码学防伪；当前实现防误用，不防合法格式伪造，正式验真需 reader/bus 的签名或 `contract_id` 白名单。
 
 示例烟雾测试：
 
@@ -173,7 +180,7 @@ v0.3.0 含 **49 项合成数据单测**，覆盖米重公式、GB/T 706 查表�
 cd ../..
 python3 scripts/steel_tonnage.py --validate examples/minimal.steel.json
 python3 scripts/steel_tonnage.py \
-  --steel examples/minimal.steel.json --out-prefix /tmp/minimal-ton
+  --steel examples/minimal.steel.json --allow-manual --out-prefix /tmp/minimal-ton
 ```
 
 ## 许可

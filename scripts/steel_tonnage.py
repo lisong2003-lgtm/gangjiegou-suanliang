@@ -21,7 +21,13 @@
 输出为估算带（±15%），final_quantity=false，不替代深化设计、翻样或结算。
 
 用法
-  python3 steel_tonnage.py --steel 钢结构识图/xxx.steel.json --out-prefix 钢结构吨位
+  # 正式入口：只从 lis-skill-bus 按 contract_id 取契约
+  python3 steel_tonnage.py --from-contract <contract_id> --project 项目 --out-prefix 钢结构吨位
+  # 手工/文件降级：必须显式 --allow-manual，结果 final_quantity=false
+  python3 steel_tonnage.py --steel 钢结构识图/xxx.steel.json --allow-manual --out-prefix 钢结构吨位
+
+来源准入由 contract_guard.guard_contract 把关；缺 reader/bus 时先跑 --check-deps，
+不得自行实现 DWG/DXF 解析或用其它解析器兜底。
 """
 from __future__ import annotations
 
@@ -35,17 +41,28 @@ except Exception:
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 from collections import defaultdict
+from datetime import datetime
 from io import StringIO
 from pathlib import Path
 from typing import Any
 
+from contract_guard import GuardError, guard_contract, stamp_result
+import contract_support as cs
+import entry_gate as eg
+
 SCHEMA = "cad-steel-tonnage/v0.2"
 INPUT_SCHEMA = "cad-steel-geometry/v1"
+CONTRACT_SCHEMA = "cad-contract/v1"
+SKILL_NAME = "gangjiegou-suanliang"
+SKILL_VERSION_FALLBACK = "0.4.0"
 RHO = 0.00785  # mm² → kg/m
 KNOWN_GRADES = (
     "Q235", "Q345", "Q355", "Q390", "Q420", "Q460",
@@ -821,6 +838,8 @@ def member_merge(members: list[dict], parsed_sections: list[dict],
             "length_evidence": rec["length_evidence"],
             "x": rec["x"], "y": rec["y"], "z": rec["z"],
             "rotation": rec["rotation"],
+            "zone": next((str(x.get("zone")) for x in rec["members"] if x.get("zone")), ""),
+            "floor": next((str(x.get("floor")) for x in rec["members"] if x.get("floor")), ""),
             "coord_unit": "mm",
             "location_status": ("provided" if rec["x"] is not None and rec["y"] is not None
                                 else "missing"),
@@ -993,24 +1012,258 @@ def _first_existing_skill(*names: str) -> str | None:
     return None
 
 
-def prerequisites_status() -> dict:
-    """探测正式识图链路的前置依赖；只读，不改环境。"""
-    cad = os.environ.get("CAD_FILE_READER_HOME") or _first_existing_skill("cad-file-reader")
+
+# ---------------------------------------------------------------- 来源闸门
+
+def _skill_version() -> str:
+    """从 manifest.json 读版本；读不到时用常量，避免结果里出现空版本。"""
+    manifest = Path(__file__).resolve().parent.parent / "manifest.json"
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        version = str(data.get("version") or "").strip()
+        if version:
+            return version
+    except (OSError, json.JSONDecodeError):
+        pass
+    return SKILL_VERSION_FALLBACK
+
+
+def _now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _doc_unit(doc) -> str:
+    """兼容 guard 认的几种坐标单位位置，只用于判断是否需要补 mm。"""
+    if not isinstance(doc, dict):
+        return ""
+    candidates = [
+        doc.get("coordinate_unit"),
+        (doc.get("units") or {}).get("coordinate") if isinstance(doc.get("units"), dict) else None,
+        (doc.get("coordinate") or {}).get("unit") if isinstance(doc.get("coordinate"), dict) else None,
+        ((doc.get("contract") or {}).get("coordinate_unit")
+         if isinstance(doc.get("contract"), dict) else None),
+        (doc.get("source") or {}).get("unit") if isinstance(doc.get("source"), dict) else None,
+    ]
+    for raw in candidates:
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    return ""
+
+
+def _pick_reader_version(*docs) -> str:
+    """从契约/载荷里找 cad-file-reader 的版本标识（如 cad-file-reader/v0）。"""
+    paths = (
+        ("reader_version",),
+        ("spec",),
+        ("producer", "reader_version"),
+        ("producer", "schema"),
+        ("_provenance", "reader_version"),
+        ("_provenance", "schema"),
+    )
+    for doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        for path in paths:
+            cur = doc
+            for key in path:
+                cur = cur.get(key) if isinstance(cur, dict) else None
+            if isinstance(cur, str) and cur.strip().lower().startswith("cad-file-reader"):
+                return cur.strip()
+    return ""
+
+
+def _bus_client_path() -> Path | None:
+    """定位 lis-skill-bus 的 CLI；支持 SKILLBUS_HOME 和常见技能根。"""
     bus = os.environ.get("SKILLBUS_HOME") or _first_existing_skill("lis-skill-bus")
-    missing = []
-    if not cad:
-        missing.append("cad-file-reader>=0.39.2（含 packs/steel-geometry）")
     if not bus:
-        missing.append("lis-skill-bus>=0.1.9")
-    return {
-        "cad_file_reader": {"found": bool(cad), "path": cad},
-        "lis_skill_bus": {"found": bool(bus), "path": bus},
-        "ready_for_formal_pipeline": bool(cad and bus),
-        "scope": "仅正式识图链路（cad-file-reader -> lis-skill-bus -> 本技能）需要；"
-                 "直接消费已有 *.steel.json 计算不受影响。",
-        "install_hint": ("缺 " + "、".join(missing) + "；未装齐前无法从 DWG 出数，"
-                         "只能用已有契约 JSON 计算。") if missing else None,
+        return None
+    for cand in (Path(bus) / "skillbus_client.py",
+                 Path(bus) / "scripts" / "skillbus_client.py"):
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _bus_pull(project: str, contract_id: str) -> tuple[dict | None, str]:
+    """按 contract_id 从 bus 取 entry；返回 (entry, error)。"""
+    client = _bus_client_path()
+    if client is None:
+        return None, (
+            "找不到 lis-skill-bus/skillbus_client.py。安装："
+            "bash ${CODEX_HOME:-$HOME/.codex}/skills/lis-skill-bus/install_skillbus.sh --apply"
+        )
+    cmd = [sys.executable, str(client), "pull", "--project", project,
+           "--entry-id", contract_id]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, "bus pull 执行失败：%s" % exc
+    if proc.returncode != 0:
+        return None, "bus pull 失败 rc=%d：%s" % (
+            proc.returncode, (proc.stderr or "").strip()[-300:])
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None, "bus pull 输出不是 JSON：%s" % (proc.stdout or "")[:200]
+    entry = data.get("entry")
+    if not data.get("hit") or not isinstance(entry, dict):
+        return None, str(data.get("reason") or "bus 中未找到契约 %s" % contract_id)
+    return entry, ""
+
+
+def _normalize_bus_entry(entry: dict, requested_id: str) -> tuple[dict, dict, list[str]]:
+    """把 bus entry 归一成 (guard 用的 cad-contract/v1 文档, 实际算量载荷, 警告)。"""
+    warnings: list[str] = []
+    schema = str(entry.get("schema") or "").strip()
+    payload = entry.get("contract") if schema == CONTRACT_SCHEMA else entry
+    if not isinstance(payload, dict):
+        payload = entry
+
+    provenance = str(entry.get("provenance") or "").strip()
+    if not provenance:
+        meta = entry.get("_provenance") if isinstance(entry.get("_provenance"), dict) else {}
+        producer = entry.get("producer") if isinstance(entry.get("producer"), dict) else {}
+        provenance = str(
+            meta.get("source_skill") or meta.get("source") or meta.get("mode")
+            or producer.get("skill") or "").strip()
+    contract_id = str(
+        entry.get("contract_id") or entry.get("_id") or requested_id or "").strip()
+
+    if schema == CONTRACT_SCHEMA:
+        guard_doc = dict(entry)
+        if not guard_doc.get("contract_id"):
+            guard_doc["contract_id"] = contract_id
+        if not guard_doc.get("provenance") and provenance:
+            guard_doc["provenance"] = provenance
+        if not _doc_unit(guard_doc) and not _doc_unit(payload):
+            guard_doc["coordinate_unit"] = "mm"
+            warnings.append("bus 契约未声明坐标单位，按本技能既有 mm 口径处理；算量前请核对。")
+        if not isinstance(guard_doc.get("source"), dict) and isinstance(payload.get("source"), dict):
+            guard_doc["source"] = payload.get("source")
+        return guard_doc, payload, warnings
+
+    if schema == INPUT_SCHEMA:
+        # bus 里直接放了未包 envelope 的载荷：合成最小 cad-contract/v1 外壳再验。
+        guard_doc = {
+            "schema": CONTRACT_SCHEMA,
+            "provenance": provenance or "manual",
+            "contract_id": contract_id,
+            "coordinate_unit": _doc_unit(payload) or "mm",
+            "contract": payload,
+        }
+        if isinstance(payload.get("source"), dict):
+            guard_doc["source"] = payload.get("source")
+        if not _doc_unit(payload):
+            warnings.append("bus 契约未声明坐标单位，按本技能既有 mm 口径处理；算量前请核对。")
+        return guard_doc, payload, warnings
+
+    guard_doc = dict(entry)
+    if not guard_doc.get("contract_id"):
+        guard_doc["contract_id"] = contract_id
+    return guard_doc, payload, warnings
+
+
+def _guard_from_dict(doc: dict, *, allow_manual: bool,
+                     label: str = "<契约>") -> dict:
+    """把 dict 落临时文件后交给共享 guard；bus 文档无法保留原始字节，跳过内嵌哈希绊线。"""
+    with tempfile.TemporaryDirectory(prefix="steel_contract_") as tmp:
+        path = Path(tmp) / "contract.json"
+        path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            return guard_contract(path, allow_manual=allow_manual, require_hash=False)
+        except GuardError as exc:
+            # 临时文件已删除，错误提示里的路径换回真实来源，避免给用户死路径。
+            raise GuardError(
+                exc.code,
+                exc.message.replace(str(path), label),
+                exc.hint.replace(str(path), label),
+            ) from None
+
+
+def _synthetic_guard_doc(payload: dict) -> dict:
+    """给裸 cad-steel-geometry/v1 载荷套最小 cad-contract/v1 外壳；不改载荷本身。"""
+    provenance = str(payload.get("provenance") or "").strip()
+    contract_id = str(
+        payload.get("contract_id") or payload.get("contractId") or "").strip()
+    doc = {
+        "schema": CONTRACT_SCHEMA,
+        "provenance": provenance,
+        "contract_id": contract_id,
+        "coordinate_unit": _doc_unit(payload),
+        "contract": payload,
     }
+    if isinstance(payload.get("source"), dict):
+        doc["source"] = payload.get("source")
+    return doc
+
+
+def _guard_file_manual(path: str) -> tuple[dict, dict]:
+    """文件路径一律按 manual 降级；返回 (guard, 算量载荷)。
+
+    * 裸 cad-steel-geometry/v1：套 cad-contract/v1 外壳后验来源/单位；
+    * 已是 cad-contract/v0|v1：原样验版本，v0 会 exit 4。
+    """
+    data, load_err = _load_json(path)
+    if load_err:
+        raise GuardError(2, load_err, hint="先确认路径：ls -l %s" % path)
+    if not isinstance(data, dict):
+        raise GuardError(2, "契约顶层必须是 JSON 对象", hint="检查文件开头")
+    schema = str(data.get("schema") or "").strip()
+    if schema == INPUT_SCHEMA:
+        guard = _guard_from_dict(_synthetic_guard_doc(data), allow_manual=True, label=path)
+        payload = data
+    else:
+        guard = guard_contract(path, allow_manual=True)
+        payload = data.get("contract") if (
+            schema == CONTRACT_SCHEMA and isinstance(data.get("contract"), dict)) else data
+    if guard.get("mode") == "formal":
+        guard = dict(guard)
+        guard["mode"] = "manual"
+        guard["provenance"] = "manual"
+        guard["formal_ledger_eligible"] = False
+        guard["warnings"] = list(guard.get("warnings") or []) + [
+            "来源是文件路径而不是 bus，已按 manual 降级；正式量请用 --from-contract。"
+        ]
+    return guard, payload
+
+
+def _validated_payload(data) -> dict:
+    """结构不合法 -> exit 2；空证据 -> exit 5（数据不足）。"""
+    try:
+        return _validate_contract(data)
+    except SystemExit as exc:
+        message = str(exc)
+        code = 5 if "空输入" in message else 2
+        print(message, file=sys.stderr)
+        raise SystemExit(code) from None
+
+
+def _run_manifest(guard: dict) -> dict:
+    """统一 run_manifest（contract-only 入口）；只记版本/参数/时间/契约哈希，不记图纸内容。"""
+    return cs.run_manifest(SKILL_NAME, _skill_version(), guard, argv=sys.argv[1:])
+
+
+def _print_guard_error(exc: GuardError) -> None:
+    print("[GuardError %d] %s" % (exc.code, exc.message), file=sys.stderr)
+    if exc.hint:
+        print("修复: %s" % exc.hint, file=sys.stderr)
+
+
+def prerequisites_status() -> dict:
+    """探测正式识图链路的前置依赖；统一走 contract_support，只读，不改环境。"""
+    status = cs.check_deps()
+    status["scope"] = ("仅正式识图链路（cad-file-reader -> lis-skill-bus -> 本技能）需要；"
+                       "文件契约必须显式加 --allow-manual，结果按 manual 降级、不是正式量。")
+    return status
+
+
+def _install_command(st: dict) -> str:
+    parts = []
+    if not st["lis_skill_bus"]["found"]:
+        parts.append("bash ${CODEX_HOME:-$HOME/.codex}/skills/lis-skill-bus/install_skillbus.sh --apply")
+    if not st["cad_file_reader"]["found"]:
+        parts.append("bash ${CODEX_HOME:-$HOME/.codex}/skills/cad-file-reader/scripts/setup.sh")
+    return " && ".join(parts)
 
 
 def format_prerequisites(st: dict) -> str:
@@ -1024,6 +1277,8 @@ def format_prerequisites(st: dict) -> str:
     ]
     if st.get("install_hint"):
         lines.append(f"- 处理：{st['install_hint']}")
+        lines.append(f"- 安装命令（复制执行）：{_install_command(st)}")
+        lines.append("- 包本身不存在时，先从 SkillHub 安装对应技能，再执行上面的命令。")
     return "\n".join(lines)
 
 
@@ -1283,18 +1538,58 @@ def allowance_advice(total_band: list[float]) -> dict:
 
 # ---------------------------------------------------------------- 汇总
 
+def _handoff_members(merged: list[dict]) -> list[dict]:
+    """把构件归并结果映射成 site-handoff/v1 成员。
+
+    只输出已有证据：坐标(mm→m)缺失写 null，吨位缺失写 null/unknown；
+    吨位带取上限（+15%）作为吊装保守重量，basis 明确标注估算口径。
+    """
+    members = []
+    for row in merged:
+        x, y, z = row.get("x"), row.get("y"), row.get("z")
+        x_m = round(float(x) / 1000.0, 4) if x is not None else None
+        y_m = round(float(y) / 1000.0, 4) if y is not None else None
+        z_m = round(float(z) / 1000.0, 4) if z is not None else None
+        band = row.get("tonnage_t") or []
+        weight_t = round(float(band[1]), 4) if len(band) >= 2 else None
+        weight_basis = "estimate_band_upper" if weight_t is not None else "unknown"
+        sections = row.get("sections") or []
+        section = str(sections[0].get("text") or "") if sections else ""
+        grade = row.get("grade") or ""
+        if grade in ("unknown_grade", "mixed_grade"):
+            grade = ""
+        length_m = row.get("explicit_length_m") or None
+        members.append(cs.handoff_member(
+            row.get("code") or "",
+            weight_t=weight_t, length_m=length_m, section=section, grade=grade,
+            x_m=x_m, y_m=y_m, z_m=z_m,
+            zone=str(row.get("zone") or ""), floor=str(row.get("floor") or ""),
+            weight_basis=weight_basis,
+            coord_status=("provided" if x_m is not None and y_m is not None else "missing"),
+            kind="、".join(row.get("categories") or []),
+            instance_count=row.get("instance_count"),
+        ))
+    return members
+
+
 def build(steel_path: str, out_prefix: str,
-          length_scenarios: list[float] | None = None) -> Path:
-    steel_path_obj = Path(steel_path)
-    try:
-        with steel_path_obj.open(encoding="utf-8") as f:
-            steel = json.load(f)
-    except FileNotFoundError as exc:
-        raise SystemExit(f"❌ 输入文件不存在：{steel_path}") from exc
-    except json.JSONDecodeError as exc:
-        raise SystemExit(
-            f"❌ 非契约 JSON：{steel_path} 解析失败"
-            f"（第 {exc.lineno} 行，第 {exc.colno} 列）") from exc
+          length_scenarios: list[float] | None = None,
+          payload: dict | None = None,
+          guard: dict | None = None,
+          run_manifest: dict | None = None) -> Path:
+    if payload is None:
+        steel_path_obj = Path(steel_path)
+        try:
+            with steel_path_obj.open(encoding="utf-8") as f:
+                steel = json.load(f)
+        except FileNotFoundError as exc:
+            raise SystemExit(f"❌ 输入文件不存在：{steel_path}") from exc
+        except json.JSONDecodeError as exc:
+            raise SystemExit(
+                f"❌ 非契约 JSON：{steel_path} 解析失败"
+                f"（第 {exc.lineno} 行，第 {exc.colno} 列）") from exc
+    else:
+        steel = payload
     steel = _validate_contract(steel)
     sections = steel.get("sections") or []
     members = steel.get("members") or []
@@ -1453,6 +1748,21 @@ def build(steel_path: str, out_prefix: str,
             "总吨位口径": total_basis,
         },
     }
+    if guard:
+        stamp_result(out, guard)
+        out["reader_version"] = guard.get("reader_version") or ""
+    else:
+        out["provenance"] = "manual"
+        out["contract_id"] = ""
+        out["source_sha256"] = ""
+        out["contract_sha256"] = ""
+        out["formal_ledger_eligible"] = False
+        out["reader_version"] = ""
+    out["run_manifest"] = run_manifest or cs.run_manifest(
+        SKILL_NAME, _skill_version(), guard, argv=[])
+    cs.write_handoff(Path(out_prefix).resolve().parent,
+                     str(steel.get("project") or ""), "steel",
+                     guard or {}, _handoff_members(merged))
     _render(out, Path(steel_path).stem, out_prefix)
     return Path(str(out_prefix) + ".csv")
 
@@ -1470,14 +1780,18 @@ def _render(out: dict, title: str, out_prefix: str) -> None:
              "（不含圆角，H 型偏低 1~2%、冷弯 C/Z 偏低 2~5%）；不替代深化设计、翻样、下料与结算。\n")
     md.write(f"> 长度口径：**{out['length_note']}**\n")
     pre = out.get("prerequisites") or {}
-    if pre.get("ready_for_formal_pipeline"):
-        md.write("> 前置探测：cad-file-reader ✅ / lis-skill-bus ✅（正式识图链路可用）\n")
+    provenance = out.get("provenance") or "unknown"
+    if provenance == "reader":
+        md.write("> 输入来源：lis-skill-bus 正式契约（provenance=reader，contract_id={}）\n".format(
+            out.get("contract_id") or "-"))
     else:
-        md.write("> 前置探测：cad-file-reader {} / lis-skill-bus {}；正式识图链路不可用。"
-                 "本报告由已有契约计算，不受影响。\n".format(
-                     "✅" if pre.get("cad_file_reader", {}).get("found") else "❌",
-                     "✅" if pre.get("lis_skill_bus", {}).get("found") else "❌"))
-        if pre.get("install_hint"):
+        md.write("> 输入来源：文件契约手工降级（provenance={}），不是正式量；"
+                 "正式量请用 --from-contract。\n".format(provenance))
+    if not pre.get("ready_for_formal_pipeline"):
+        problems = pre.get("problems") or []
+        md.write("> 前置体检未通过：{}；识图仍由 cad-file-reader 完成，本技能不自带解图器。\n".format(
+            "；".join(problems) if problems else "存在缺项"))
+        if pre.get("install_hint") and pre.get("missing"):
             md.write(f"> {pre['install_hint']}\n")
     ev = out.get("input_evidence") or {}
     if ev and not ev.get("steel_geometry"):
@@ -1683,23 +1997,37 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description="Steel tonnage estimate from cad_steel_geometry output")
     ap.add_argument("contract", nargs="?",
-                    help="契约 JSON 路径（--validate 时可作为位置参数）")
+                    help="契约 JSON 路径（文件路径算量/mode=manual；--validate 时可作为位置参数）")
     ap.add_argument("--steel",
-                    help="cad_steel_geometry 产物 *.steel.json（计算模式必填）")
+                    help="cad_steel_geometry 产物 *.steel.json（文件路径算量，必须配 --allow-manual）")
+    ap.add_argument("--from-contract", metavar="CONTRACT_ID",
+                    help="按 contract_id 从 lis-skill-bus 取正式契约（bus-only 入口）")
+    ap.add_argument("--project", default="",
+                    help="--from-contract 使用的 bus 项目标识")
+    ap.add_argument("--allow-manual", action="store_true",
+                    help="显式允许手工/文件契约；结果 provenance=manual、final_quantity=false")
     ap.add_argument("--out-prefix", help="输出前缀（计算模式必填）")
     ap.add_argument("--validate", action="store_true",
                     help="只体检输入契约：缺字段、未匹配截面、仅计数项；不出吨位")
     ap.add_argument("--report", help="--validate 时把体检报告另存为 JSON")
     ap.add_argument("--check-deps", action="store_true",
-                    help="检查正式识图链路前置（cad-file-reader / lis-skill-bus）")
+                    help="检查正式识图链路前置（cad-file-reader / lis-skill-bus）；缺 reader=20、缺 bus=21")
     ap.add_argument("--length-scenario", action="append", type=float, default=[],
                     metavar="M", help="长度敏感性场景（米，可重复，如 --length-scenario 4.5）")
     a = ap.parse_args(raw)
 
     if a.check_deps:
-        status = prerequisites_status()
-        print(format_prerequisites(status))
-        raise SystemExit(0 if status["ready_for_formal_pipeline"] else 1)
+        status = cs.check_deps()
+        print(cs.format_deps(status))
+        raise SystemExit(eg.dependency_exit_code())
+
+    # 入口闸门：缺 cad-file-reader / lis-skill-bus 先停；直接给图纸一律拒收。
+    try:
+        eg.require_reader()
+        eg.require_bus()
+        eg.reject_drawing_input(a.contract, a.steel)
+    except eg.GateError as exc:
+        raise SystemExit(eg.print_gate_error(exc)) from None
 
     steel_path = a.steel or a.contract
     if a.validate:
@@ -1715,9 +2043,67 @@ def main() -> None:
             print(f"体检报告：{rp}")
         raise SystemExit(0 if report["status"] != "error" else 2)
 
-    if not steel_path or not a.out_prefix:
-        ap.error("计算模式需要 --steel 和 --out-prefix；只体检请用 --validate")
-    build(steel_path, a.out_prefix, length_scenarios=a.length_scenario)
+    if a.from_contract and a.contract:
+        print("WARN: 位置参数 contract 与 --from-contract 同时出现，"
+              "已忽略位置参数，以 --from-contract=%s 为准。" % a.from_contract,
+              file=sys.stderr)
+
+    if not a.out_prefix:
+        ap.error("计算模式需要 --out-prefix；只体检请用 --validate")
+
+    if a.from_contract:
+        # 正式入口：只认 bus 里的契约；取不到就停，不退回本地文件/自写解析。
+        entry, err = _bus_pull(a.project, a.from_contract)
+        if entry is None:
+            print("❌ 未取到契约 %s：%s" % (a.from_contract, err), file=sys.stderr)
+            print("拉取命令（复制执行）：python3 ${CODEX_HOME:-$HOME/.codex}/skills/lis-skill-bus/"
+                  "skillbus_client.py pull --project %s --entry-id %s"
+                  % (a.project or "<项目>", a.from_contract), file=sys.stderr)
+            print("安装 bus（复制执行）：bash ${CODEX_HOME:-$HOME/.codex}/skills/lis-skill-bus/"
+                  "install_skillbus.sh --apply", file=sys.stderr)
+            raise SystemExit(1)
+        guard_doc, payload, bus_warnings = _normalize_bus_entry(
+            entry, a.from_contract)
+        try:
+            guard = _guard_from_dict(guard_doc, allow_manual=False,
+                                     label="bus:%s" % a.from_contract)
+        except GuardError as exc:
+            _print_guard_error(exc)
+            raise SystemExit(exc.code) from None
+        if guard.get("mode") != "formal":
+            print("❌ 契约来源不是 reader/bus，不能进正式算量。", file=sys.stderr)
+            raise SystemExit(3)
+        guard["warnings"] = list(guard.get("warnings") or []) + bus_warnings
+        guard["reader_version"] = _pick_reader_version(guard_doc, payload)
+        payload = _validated_payload(payload)
+        safe_id = re.sub(r"[^0-9A-Za-z._-]+", "-", a.from_contract)[:64] or "contract"
+        build("bus-" + safe_id, a.out_prefix,
+              length_scenarios=a.length_scenario, payload=payload,
+              guard=guard, run_manifest=_run_manifest(guard))
+        return
+
+    if not steel_path:
+        ap.error("计算模式需要 --from-contract 或 --steel/位置参数 + --out-prefix；"
+                 "只体检请用 --validate")
+
+    # 文件/手工入口：必须显式 --allow-manual；缺了就 exit 3。
+    if not a.allow_manual:
+        print("❌ 来源未授权：--steel/位置参数是文件契约，必须同时给 --allow-manual。",
+              file=sys.stderr)
+        print("正式量请用 --from-contract <contract_id> --project <项目>；"
+              "手工降级请加 --allow-manual（结果 final_quantity=false）。",
+              file=sys.stderr)
+        raise SystemExit(3)
+
+    try:
+        guard, payload = _guard_file_manual(steel_path)
+    except GuardError as exc:
+        _print_guard_error(exc)
+        raise SystemExit(exc.code) from None
+    guard["reader_version"] = _pick_reader_version(guard.get("contract") or {})
+    payload = _validated_payload(payload)
+    build(steel_path, a.out_prefix, length_scenarios=a.length_scenario,
+          payload=payload, guard=guard, run_manifest=_run_manifest(guard))
 
 
 if __name__ == "__main__":

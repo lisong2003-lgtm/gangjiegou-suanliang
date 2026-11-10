@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.4.3 · 2026-11-10 · S9 发布准备：版本收口
+
+- 版本 patch bump；同步套件最低版本。s9 发布准备，未改算量逻辑。
+
+## 0.4.2 · 2026-11-10 · 入口闸门 vendored（只吃契约，不解图）
+
+- **新增 `scripts/entry_gate.py`**（与 `lis-skill-bus/lib/entry_gate.py` 同源 vendor，纯 stdlib）：统一退出码 `20` 缺 reader、`21` 缺 bus、`22` 契约无效、`23` 图纸输入、`24` 证据不足。
+- **`--check-deps` 改为稳定码**：齐全 `0`，缺 `cad-file-reader>=0.41.0` 返回 `20`，缺 `lis-skill-bus>=0.1.11` 返回 `21`，并打印安装命令。
+- **图纸入口封死**：DWG/DXF/DWT 直接退出 `23`，打印固定中文提示；删除 `CAD_ALLOW_DIRECT` 等“开发直读”说法，不提供任何直读逃生开关。
+- **SKILL.md** 顶部新增退出码表与固定提示；`manifest.scripts` 登记 `scripts/entry_gate.py`。
+
+## 0.4.1 · 2026-11-09 · 统一 contract_support 与 site_handoff
+
+- **统一支撑层**：`--check-deps` 改用 `contract_support.check_deps()`（版本门槛 0.41.0 / 0.1.11）；`run_manifest` 改用 `contract_support.run_manifest()`，固定 `entry_policy=contract-only`、`manual_requires_flag=true`。
+- **新增 `site_handoff.json`**（`specialty=steel`）：成员来自 `member_merge`；坐标 mm→m，缺失写 `null`/`coord_status=missing`；吨位带取上限作为吊装保守重量（`weight_basis=estimate_band_upper`），无吨位写 `weight_t=null`/`weight_basis=unknown`。
+- **manifest 统一**：`requires.skills={cad-file-reader>=0.41.0, lis-skill-bus>=0.1.11}`，`entry_policy=contract-only`。
+- **验证**：`tests/test_steel_tonnage.py` 49 项、`tests/test_entry_gate.py` 7 项全 PASS。
+
+## 0.4.0 · 2026-11-09 · 主门闸：正式量只走 bus 契约
+
+- **BREAKING：文件入口必须显式授权**。`--steel`/位置参数不再默认可用，缺少 `--allow-manual` 时直接退出 3，不产出任何文件。
+- **正式量只认 bus 契约**：新增 `--from-contract <contract_id>` + `--project <项目>`，按 `contract_id` 从 `lis-skill-bus` 取契约；取不到退出 1，来源不是 reader/bus 退出 3，契约版本不符退出 4。不退回本地文件，也不另开解析路径。
+- **文件入口强制降级**：走 `--steel`/位置参数时，即使 JSON 自称 `provenance=reader` 且带 `contract_id`，也一律改写为 `provenance=manual`、`formal_ledger_eligible=false`、`final_quantity=false`，不能进正式台账。
+- **新增溯源字段**：输出固定带 `provenance`、`contract_id`、`source_sha256`、`contract_sha256`、`reader_version`、`formal_ledger_eligible`、`run_manifest`，报告头部同步说明来源与降级状态。
+- **代码闸门落地**：新增 `scripts/contract_guard.py`（`guard_contract` 调用点），统一校验契约版本、来源和必需 section，替换原先分散在入口的隐式判断。
+- **文案纠正**：`--check-deps` 与报告里的“已有契约计算不受影响”改为“文件契约必须加 `--allow-manual`，结果按 manual 降级，不是正式量”。
+- **测试**：新增 `tests/test_entry_gate.py` 入口闸门 7 项（`--check-deps` 齐全、缺开关 exit 3、`--allow-manual` 降级、伪造 reader 拒绝、bus 缺契约 exit 1、`cad-contract/v0` 拒绝、正常 reader 契约），旧合成单测 49 项继续全绿。
+
+旧命令迁移：
+
+```bash
+# 旧写法（0.4.0 起退出 3，不产文件）
+python3 scripts/steel_tonnage.py --steel a.steel.json --out-prefix out
+
+# 手工降级（结果 provenance=manual、final_quantity=false，不是正式量）
+python3 scripts/steel_tonnage.py \
+  --steel a.steel.json --allow-manual --out-prefix out
+
+# 正式量（契约由 cad-file-reader 产出并经 lis-skill-bus 发布）
+python3 scripts/steel_tonnage.py \
+  --from-contract <contract_id> --project 项目 --out-prefix out
+```
+
 ## 0.3.8 · 2026-11-09 · 常驻注入瘦身
 
 - **description 精简**：技能目录注入的 description 压到 ≤45 字，保留原有触发词与「不做什么」边界；SKILL.md 正文与算法口径未变。

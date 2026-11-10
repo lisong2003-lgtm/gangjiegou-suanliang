@@ -2,9 +2,9 @@
 
 **[English](./README.en.md) | [中文](./README.md)**
 
-**v0.3.0** · Converts an existing `*.steel.json` contract from the `cad-file-reader` steel-geometry pack into a section spectrum, tonnage estimate band, and member ledger. It does not read or interpret drawings.
+**v0.4.0** · Formal quantities are loaded from `lis-skill-bus` by `contract_id`; the skill converts the `cad-file-reader` steel contract into a section spectrum, tonnage estimate band, and member ledger without reading drawings.
 
-The formal recognition path is fixed: `cad-file-reader -> cad-contract/v1 -> lis-skill-bus -> gangjiegou-suanliang`. This skill never reads DWG/DXF/PDF and does not provide a second recognition path that bypasses `cad-file-reader` or `lis-skill-bus`.
+The formal recognition path is fixed: `cad-file-reader -> cad-contract/v1 -> lis-skill-bus -> gangjiegou-suanliang`. This skill never reads DWG/DXF/PDF and does not provide a second recognition path that bypasses `cad-file-reader` or `lis-skill-bus`. `--steel`/a positional file path is a manual entry and requires explicit `--allow-manual`; it is never a formal quantity.
 
 ## Check availability first
 
@@ -15,8 +15,8 @@ python3 scripts/steel_tonnage.py --check-deps
 ```
 
 - Both found: exit 0; the formal recognition path is ready.
-- Either missing: exit 1 and an explicit missing-dependency message. Existing `*.steel.json` files can still be calculated, but a DWG cannot be recognized.
-- `manifest.json` declares `cad-file-reader>=0.39.2 (with cad-file-reader:packs/steel-geometry)` and `lis-skill-bus>=0.1.9` under `requires.skills`.
+- Either missing: exit 20 (no cad-file-reader) or 21 (no lis-skill-bus), an explicit missing-dependency message, and one copyable install command. A DWG cannot be recognized. A file contract can still be calculated only with explicit `--allow-manual`; the result has `final_quantity=false` and is not a formal quantity.
+- `manifest.json` declares `cad-file-reader>=0.41.0 (with cad-file-reader:packs/steel-geometry)` and `lis-skill-bus>=0.1.11` under `requires.skills`.
 
 ## What it does
 
@@ -45,7 +45,7 @@ python3 scripts/steel_tonnage.py --check-deps
 ### 1. Formal recognition path
 
 ```bash
-# Probe prerequisites first; exit 1 when either is missing
+# Probe prerequisites first; exit 20/21 when a dependency is missing
 python3 scripts/steel_tonnage.py --check-deps
 
 # Reuse a matching contract when available; no second drawing parse
@@ -67,19 +67,20 @@ bash skills/cad-file-reader/scripts/cad_statesync.sh push \
 python3 scripts/steel_tonnage.py \
   --validate steel-geometry/detail.steel.json --report contract-health.json
 
-# Calculate JSON/MD/CSV
+# Formal quantity: load by contract_id from the bus and write JSON/MD/CSV
+# contract_id comes from the push output or a bus pull result
 python3 scripts/steel_tonnage.py \
-  --steel steel-geometry/detail.steel.json --out-prefix steel-tonnage
+  --from-contract <contract_id> --project PROJECT --out-prefix steel-tonnage
 ```
 
-### 2. Calculate from an existing contract
+### 2. Load a formal contract from the bus
 
 ```bash
 python3 scripts/steel_tonnage.py \
-  --steel path/to/detail.steel.json --out-prefix /tmp/steel-tonnage
+  --from-contract <contract_id> --project PROJECT --out-prefix /tmp/steel-tonnage
 ```
 
-This is a calculation entry, not a second recognition path. The contract must come from the formal chain or from the supported manual template.
+This is the formal-quantity entry, not a second recognition path. The contract must be produced by the formal chain and stored by `lis-skill-bus`. Saving a bus artifact to a local file and passing it through `--steel` forces the run into manual mode.
 
 ### 3. Manual contract (supported fallback)
 
@@ -88,7 +89,7 @@ When the recognition layer is unavailable, constructing `*.steel.json` by hand i
 ```bash
 python3 scripts/steel_tonnage.py --validate examples/minimal.steel.json
 python3 scripts/steel_tonnage.py \
-  --steel examples/minimal.steel.json --out-prefix /tmp/minimal-ton
+  --steel examples/minimal.steel.json --allow-manual --out-prefix /tmp/minimal-ton
 ```
 
 `examples/minimal.steel.json` is the minimum sample. `examples/README.md` documents required fields, section-to-member matching, millimetre coordinates, and `$`-nested layer names.
@@ -97,7 +98,7 @@ python3 scripts/steel_tonnage.py \
 
 ```bash
 python3 scripts/steel_tonnage.py \
-  --steel path/to/detail.steel.json --out-prefix steel-tonnage \
+  --from-contract <contract_id> --project PROJECT --out-prefix steel-tonnage \
   --length-scenario 4.5 --length-scenario 6 --length-scenario 9
 ```
 
@@ -107,10 +108,13 @@ python3 scripts/steel_tonnage.py \
 
 | Option | Purpose | Exit status |
 |---|---|---|
-| `--check-deps` | Probe `cad-file-reader` / `lis-skill-bus` only | 0 when ready, 1 when missing |
+| `--check-deps` | Probe `cad-file-reader` / `lis-skill-bus` only; print one install command when missing | 0 when ready, 1 when missing |
 | `--validate <json>` | Contract health check only: fields, unmatched members, count-only sections, length evidence, dependencies | 0 when calculable, 2 on structural errors |
 | `--report <json>` | Write the health report as `cad-steel-contract-health/v1` | Follows `--validate` |
-| `--steel <json>` | Calculation input | 0 on success |
+| `--from-contract <id>` | Formal entry: load the contract from `lis-skill-bus` by `contract_id` | 0 on success; missing/source/version errors 1/3/4 |
+| `--project <project>` | Bus project used by `--from-contract` | Follows `--from-contract` |
+| `--steel <json>` | File/manual contract entry; requires `--allow-manual` | 0 on success; 3 without the flag |
+| `--allow-manual` | Explicitly permit a file contract; forces `provenance=manual`, `formal_ledger_eligible=false` | Follows the file entry |
 | `--out-prefix <prefix>` | Output `.json/.md/.csv` prefix | 0 on success |
 | `--length-scenario <m>` | Repeatable length-sensitivity scenario | 0 on success |
 
@@ -140,7 +144,7 @@ Each calculation writes three files:
 - `*.md`: readable review report with recommended total, draft allocation reference, length basis, prerequisite status, and review items at the top.
 - `*.csv`: total band, section bands, member ledger, connection/finish summaries, and section spectrum.
 
-Key fields include `length_basis`, `length_used_m`, `rows`, `spec_rows`, `only_count`, `total_t`, `total_basis`, `total_t_member_level`, `total_t_allocated_estimate`, `member_merge`, `length_scenarios`, `allowance_advice`, `geometry_closure_check`, `prerequisites`, `input_evidence`, and `summary`.
+Key fields include `provenance`, `contract_id`, `source_sha256`, `contract_sha256`, `reader_version`, `formal_ledger_eligible`, `run_manifest`, `length_basis`, `length_used_m`, `rows`, `spec_rows`, `only_count`, `total_t`, `total_basis`, `total_t_member_level`, `total_t_allocated_estimate`, `member_merge`, `length_scenarios`, `allowance_advice`, `geometry_closure_check`, `prerequisites`, `input_evidence`, and `summary`.
 
 When `steel_geometry[]`, `connections[]`, or `finishes[]` is empty, the report says “no evidence in input” so it is not confused with “not implemented”.
 
@@ -154,17 +158,20 @@ When `steel_geometry[]`, `connections[]`, or `finishes[]` is empty, the report s
 ## Dependencies
 
 - Python 3.10+; the main calculation entry uses only the standard library.
-- Formal recognition: `cad-file-reader>=0.39.2` (with `cad-file-reader:packs/steel-geometry`) and `lis-skill-bus>=0.1.9`.
-- Existing or manual contracts: neither skill is required for calculation.
+- Formal recognition: `cad-file-reader>=0.41.0` (with `cad-file-reader:packs/steel-geometry`) and `lis-skill-bus>=0.1.11`.
+- Existing or manual contracts: neither skill is required for calculation, but a file entry requires explicit `--allow-manual` and is not a formal quantity. `--from-contract` requires `lis-skill-bus`.
 
 ## Validation
 
 ```bash
+python3 tests/test_entry_gate.py
 cd scripts/tests
 python3 -m unittest test_steel_tonnage
 ```
 
-v0.3.0 includes **49 synthetic-data unit tests** covering unit-weight formulas, GB/T 706 lookups, both length bases, no-length fallback, contract rejection, duplicate codes, grade bands, `unknown_grade`, connection-plate tonnage and grade residuals, member-merge review, connection categories, finish fallback, member/allocation totals, coordinate passthrough, `--validate`, and length scenarios.
+Current v0.4.3 includes **35 entry-gate assertions + 49 synthetic-data unit tests**. The gate tests cover `--check-deps`, manual exit 3, `--allow-manual` downgrade, forged-reader rejection, missing bus contract, `cad-contract/v0` rejection, and a valid reader contract. The 49 existing tests cover unit-weight formulas, GB/T 706 lookups, both length bases, no-length fallback, contract rejection, duplicate codes, grade bands, `unknown_grade`, connection-plate tonnage and grade residuals, member-merge review, connection categories, finish fallback, member/allocation totals, coordinate passthrough, `--validate`, and length scenarios.
+
+Admission boundary: `provenance`/`contract_id` are not cryptographic proof. The current gate prevents accidental bypass, not well-formed forgery. Real verification still needs reader/bus signatures or a `contract_id` whitelist.
 
 Smoke test:
 
@@ -172,7 +179,7 @@ Smoke test:
 cd ../..
 python3 scripts/steel_tonnage.py --validate examples/minimal.steel.json
 python3 scripts/steel_tonnage.py \
-  --steel examples/minimal.steel.json --out-prefix /tmp/minimal-ton
+  --steel examples/minimal.steel.json --allow-manual --out-prefix /tmp/minimal-ton
 ```
 
 ## License

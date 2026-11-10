@@ -5,10 +5,10 @@
 ```bash
 python3 scripts/steel_tonnage.py --check-deps
 python3 scripts/steel_tonnage.py --validate examples/minimal.steel.json --report /tmp/minimal-health.json
-python3 scripts/steel_tonnage.py --steel examples/minimal.steel.json --out-prefix /tmp/minimal-ton
+python3 scripts/steel_tonnage.py --steel examples/minimal.steel.json --allow-manual --out-prefix /tmp/minimal-ton
 ```
 
-`--check-deps` 只影响正式识图链路，本示例不需要它齐全；`--validate` 可计算时退出 0、结构错误退出 2，且不写吨位文件。
+`--check-deps` 只影响正式识图链路；本示例是文件/手工契约，必须显式加 `--allow-manual`，输出 `provenance=manual`、`formal_ledger_eligible=false`、`final_quantity=false`，不是正式量。`--validate` 可计算时退出 0、结构错误退出 2，且不写吨位文件。
 
 ## 必填字段
 

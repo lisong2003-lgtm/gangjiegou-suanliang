@@ -68,7 +68,7 @@ class BusRequiredCore(Core):
         if self.find_bus_client() is not None:
             return True
         self.log_err(
-            "正式识图链路要求 lis-skill-bus>=0.1.9；请先安装总线。"
+            "正式识图链路要求 lis-skill-bus>=0.1.11；请先安装总线。"
             "本技能不会降级为本地识图，图纸必须由 cad-file-reader 解析。"
         )
         return False

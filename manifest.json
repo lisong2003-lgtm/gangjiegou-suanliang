@@ -1,18 +1,17 @@
 {
   "name": "gangjiegou-suanliang",
-  "version": "0.3.8",
+  "version": "0.4.3",
+  "entry_policy": "contract-only",
   "author": "lis",
   "license": "CC-BY-NC-SA-4.0",
   "entry": "SKILL.md",
+  "manual_requires_flag": true,
   "requires": {
     "skills": {
-      "cad-file-reader": ">=0.39.2 (with packs/steel-geometry)",
-      "lis-skill-bus": ">=0.1.9"
+      "cad-file-reader": ">=0.41.0",
+      "lis-skill-bus": ">=0.1.11"
     },
-    "skill": "cad-file-reader>=0.39.2 with packs/steel-geometry; lis-skill-bus>=0.1.9",
-    "contract": "cad-contract/v1 through lis-skill-bus",
-    "python": ">=3.10",
-    "note": "两个技能仅正式识图链路需要；已有 *.steel.json 可直接计算。单独安装本技能不会自动带入前置。"
+    "python": ">=3.10"
   },
   "scripts": [
     "scripts/pyboot.py",
@@ -21,7 +20,10 @@
     "scripts/gangjiegou_statesync.sh",
     "scripts/gangjiegou_statesync.cmd",
     "scripts/steel_tonnage.py",
-    "scripts/steel_tonnage.sh"
+    "scripts/steel_tonnage.sh",
+    "scripts/contract_guard.py",
+    "scripts/contract_support.py",
+    "scripts/entry_gate.py"
   ],
   "references": [
     "CHANGELOG.md",
@@ -31,12 +33,13 @@
     "requirements.txt"
   ],
   "tests": [
-    "scripts/tests/test_steel_tonnage.py"
+    "scripts/tests/test_steel_tonnage.py",
+    "tests/test_entry_gate.py"
   ],
   "privacy": "只在本机消费已有识图契约 JSON；发布包不含 DWG/DXF/PDF、项目数据、公司路径或图纸内容。",
-  "notes": "输出为 ±15% 吨位估算带，final_quantity=false；total_t 为推荐口径，分摊值另存 total_t_allocated_estimate；不替代深化设计、翻样、下料、结算与报价。",
+  "notes": "输出为 ±15% 吨位估算带，final_quantity=false；正式量必须从 bus 用 --from-contract 取，文件入口必须显式 --allow-manual 且 formal_ledger_eligible=false；total_t 为推荐口径，分摊值另存 total_t_allocated_estimate；不替代深化设计、翻样、下料、结算与报价。",
   "contract_schema": "cad-steel-geometry/v1 -> cad-steel-tonnage/v0.2",
-  "description": "钢结构识图契约 JSON → 牌号分档、构件归并、连接计数、涂装面积、截面谱与吨位估算带（json/md/csv）；逐根/分摊双口径、--validate 契约体检、长度敏感性场景；支持 GB/T 706 号数型槽钢/工字钢查表与两档长度口径。",
+  "description": "钢结构识图契约 JSON → 牌号分档、构件归并、连接计数、涂装面积、截面谱与吨位估算带（json/md/csv）；正式量只从 lis-skill-bus 按 contract_id 取，文件入口需 --allow-manual；逐根/分摊双口径、--validate 契约体检、长度敏感性场景；支持 GB/T 706 号数型槽钢/工字钢查表。",
   "platforms": [
     "macos",
     "windows",
